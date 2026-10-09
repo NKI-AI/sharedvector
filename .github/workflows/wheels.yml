@@ -1,0 +1,63 @@
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "src/cpp/**"
+      - "CMakeLists.txt"
+      - "conanfile.py"
+      - "pyproject.toml"
+      - "cmake/**"
+      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
+
+jobs:
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: .conan2-ci
+          key: conan-cibw-${{ matrix.arch }}-${{ hashFiles('conanfile.py') }}
+      - uses: pypa/cibuildwheel@v3.2
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          # Pull requests build one interpreter to keep the feedback loop short.
+          CIBW_BUILD: ${{ github.event_name == 'pull_request' && 'cp312-*' || '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+  publish:
+    # TODO: configure the `pypi` environment and PyPI trusted publishing once the repo has a home.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

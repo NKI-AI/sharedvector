@@ -1,0 +1,109 @@
+[build-system]
+requires = ["scikit-build-core>=0.11", "pybind11>=2.13,<4", "conan>=2.21,<3"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "sharedvector"
+version = "0.1.0"
+description = "Shared-memory chunk pool for zero-copy multi-process data loading (Boost.Interprocess + pybind11)."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "AI for Oncology" }]
+keywords = ["shared-memory", "data-loading", "pytorch", "boost-interprocess"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1"]
+zarr = ["zarr>=3.0", "tqdm>=4.60"]
+dev = ["sharedvector[torch,zarr]", "pytest>=8", "pytest-timeout>=2.3", "ruff>=0.6", "ty"]
+
+[project.scripts]
+sharedvector-producer = "sharedvector.cli:producer_main"
+sharedvector-spacing-manifest = "sharedvector.cli:spacing_manifest_main"
+
+[project.urls]
+# TODO: replace <ORG> once the GitHub organisation is decided.
+Repository = "https://github.com/<ORG>/sharedvector"
+
+# ------------------------------------------------------------------ build
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/sharedvector"]
+sdist.exclude = [".conan2-ci/", "build/", ".github/", ".venv/"]
+
+[tool.scikit-build.cmake.define]
+BUILD_TESTING = "OFF"
+
+# ------------------------------------------------------------------ wheels
+[tool.cibuildwheel]
+build = ["cp311-*", "cp312-*", "cp313-*"]
+skip = ["*-musllinux_*", "pp*"]
+build-frontend = "build[uv]"
+build-verbosity = 1
+test-requires = ["pytest", "pytest-timeout"]
+test-command = "pytest {project}/tests/python -m 'not torch and not zarr' -q -x --timeout 300"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+manylinux-x86_64-image = "manylinux_2_28"
+environment = { CONAN_HOME = "/project/.conan2-ci" }
+container-engine = { name = "docker", create-args = ["--shm-size=2g"] }
+
+# ------------------------------------------------------------------ dev environment
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# ------------------------------------------------------------------ tooling
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "D", "SIM", "RUF"]
+ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"conanfile.py" = ["RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sharedvector", "helpers"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = "-ra --strict-markers"
+timeout = 300
+markers = [
+    "torch: needs the torch extra",
+    "zarr: needs the zarr extra",
+    "slow: long-running multi-process tests",
+]

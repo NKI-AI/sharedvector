@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+wheelhouse/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build
+build/
+*.so
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# Conan (CI cache lives inside the checkout so GitHub Actions can cache it)
+.conan2-ci/
+CMakeUserPresets.json
+
+# Editors
+.vscode/
+.idea/

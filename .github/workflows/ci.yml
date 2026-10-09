@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uvx ruff check .
+      - run: uvx ruff format --check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-ty-${{ hashFiles('conanfile.py') }}
+      - run: uv sync --all-extras
+      - run: uv run ty check
+
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.py') }}
+      - run: uv sync --all-extras -v
+      - run: uv run pytest -v --timeout 600
+
+  ctest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv tool install "conan>=2.21,<3"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-ctest-${{ hashFiles('conanfile.py') }}
+      - run: >
+          cmake -S . -B build/ctest -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON -DSHAREDVECTOR_BUILD_PYTHON=OFF
+      - run: cmake --build build/ctest -j
+      - run: ctest --test-dir build/ctest --output-on-failure
