@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -59,10 +60,22 @@ struct SharedChunk {
   ShmemMutex write_lock;
   double meta[kMetaCapacity];
   std::size_t meta_size;
+  // Read statistics: reads since the last write, number of writes (the append
+  // counts as the first), and the read count captured by the last replace.
+  std::atomic<std::uint64_t> read_count;
+  std::atomic<std::uint64_t> write_count;
+  std::atomic<std::uint64_t> last_reads;
 
   SharedChunk(bi::offset_ptr<SharedVectorData> d,
               bi::offset_ptr<SharedSizeVector> s)
-      : data(d), shape(s), ref_count(0), meta{}, meta_size(0) {}
+      : data(d),
+        shape(s),
+        ref_count(0),
+        meta{},
+        meta_size(0),
+        read_count(0),
+        write_count(1),
+        last_reads(0) {}
 
   SharedChunk(const SharedChunk&) = delete;
   SharedChunk& operator=(const SharedChunk&) = delete;
@@ -97,6 +110,72 @@ using SharedChunkPtr = bi::offset_ptr<SharedChunk>;
 using SharedChunkPtrAllocator =
     bi::allocator<SharedChunkPtr, bi::managed_shared_memory::segment_manager>;
 using SharedChunksVector = bi::vector<SharedChunkPtr, SharedChunkPtrAllocator>;
+
+// Pool-wide statistics about replacements, shared by every attached process.
+// One sample (the slot's read count at the moment it was replaced) is recorded
+// per replace into a ring buffer, next to lifetime counters. All updates are
+// relaxed atomics: snapshots may lag a few events, which is fine for metrics.
+struct SharedStats {
+  // Default ring capacity is two refresh cycles of the pool; callers that want
+  // a wider window (and have budgeted the segment for it) pass it explicitly.
+  static constexpr std::size_t kMinDefaultCapacity = 16;
+
+  std::atomic<std::uint64_t> replace_events;
+  std::atomic<std::uint64_t> reads_at_replace_total;
+  std::atomic<std::uint64_t> reads_at_replace_max;
+  std::atomic<std::uint64_t> blocked_replaces;
+  std::atomic<std::uint64_t> cursor;
+  std::size_t capacity;
+  bi::offset_ptr<std::atomic<std::uint32_t>> samples;
+
+  SharedStats(std::size_t cap, bi::offset_ptr<std::atomic<std::uint32_t>> buf)
+      : replace_events(0),
+        reads_at_replace_total(0),
+        reads_at_replace_max(0),
+        blocked_replaces(0),
+        cursor(0),
+        capacity(cap),
+        samples(buf) {}
+
+  SharedStats(const SharedStats&) = delete;
+  SharedStats& operator=(const SharedStats&) = delete;
+
+  void Record(std::uint64_t reads) {
+    replace_events.fetch_add(1, std::memory_order_relaxed);
+    reads_at_replace_total.fetch_add(reads, std::memory_order_relaxed);
+    std::uint64_t seen = reads_at_replace_max.load(std::memory_order_relaxed);
+    while (seen < reads && !reads_at_replace_max.compare_exchange_weak(
+                               seen, reads, std::memory_order_relaxed)) {
+    }
+    const std::uint64_t slot = cursor.fetch_add(1, std::memory_order_relaxed);
+    const auto clipped = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(reads, UINT32_MAX));
+    samples[slot % capacity].store(clipped, std::memory_order_relaxed);
+  }
+
+  void Reset() {
+    replace_events.store(0, std::memory_order_relaxed);
+    reads_at_replace_total.store(0, std::memory_order_relaxed);
+    reads_at_replace_max.store(0, std::memory_order_relaxed);
+    blocked_replaces.store(0, std::memory_order_relaxed);
+    cursor.store(0, std::memory_order_relaxed);
+  }
+
+  std::size_t SampleCount() const {
+    return static_cast<std::size_t>(std::min<std::uint64_t>(
+        cursor.load(std::memory_order_relaxed), capacity));
+  }
+};
+
+// Plain copy of the pool-wide counters for consumption outside the segment.
+struct StatsSnapshot {
+  std::uint64_t replace_events;
+  std::uint64_t reads_at_replace_total;
+  std::uint64_t reads_at_replace_max;
+  std::uint64_t blocked_replaces;
+  std::size_t sample_count;
+  std::size_t sample_capacity;
+};
 
 struct SharedResources {
   bi::managed_shared_memory segment;
@@ -145,7 +224,8 @@ class SharedVector {
   SharedVector(const std::string& name,
                std::size_t chunk_size = 1024 * 1024 * 1 /*1MB*/,
                std::size_t max_memory_size = 1024 * 1024 * 10,
-               std::optional<DType> dtype = std::nullopt, bool create = true)
+               std::optional<DType> dtype = std::nullopt, bool create = true,
+               std::size_t stats_capacity = 0)
       : name_(name),
         chunk_size_(chunk_size),
         shared_resources_(std::make_unique<SharedResources>(
@@ -164,6 +244,7 @@ class SharedVector {
     }
 
     dtype_ = ResolveDType(dtype);
+    stats_ = ResolveStats(stats_capacity, max_memory_size / chunk_size_);
 
     shared_resources_->logical_size->store(data_chunks_->size(),
                                            std::memory_order_relaxed);
@@ -177,7 +258,11 @@ class SharedVector {
 
   DType GetDtype() const noexcept { return dtype_; }
 
-  std::shared_ptr<SharedChunk> GetChunk(std::size_t index) {
+  // Pins the chunk for the lifetime of the returned pointer. `count_read`
+  // records the access in the slot's read statistics; metadata lookups pass
+  // false so one logical read is counted once.
+  std::shared_ptr<SharedChunk> GetChunk(std::size_t index,
+                                        bool count_read = true) {
     if (index >=
         shared_resources_->logical_size->load(std::memory_order_acquire)) {
       throw std::out_of_range("Index out of range");
@@ -188,6 +273,9 @@ class SharedVector {
     {
       ScopedLock lock(raw->write_lock);
       raw->ref_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (count_read) {
+      raw->read_count.fetch_add(1, std::memory_order_relaxed);
     }
 
     return std::shared_ptr<SharedChunk>(raw, SharedChunkDeleter());
@@ -249,6 +337,9 @@ class SharedVector {
     ScopedLock lock(chunk->write_lock);
 
     if (chunk->ref_count.load(std::memory_order_acquire) > 0) {
+      if (stats_) {
+        stats_->blocked_replaces.fetch_add(1, std::memory_order_relaxed);
+      }
       throw std::runtime_error("Cannot replace chunk because it is in use");
     }
 
@@ -256,6 +347,14 @@ class SharedVector {
     chunk->data->assign(begin, begin + nbytes);
     chunk->shape->assign(shape.begin(), shape.end());
     chunk->SetMeta(meta);
+
+    const std::uint64_t reads =
+        chunk->read_count.exchange(0, std::memory_order_relaxed);
+    chunk->last_reads.store(reads, std::memory_order_relaxed);
+    chunk->write_count.fetch_add(1, std::memory_order_relaxed);
+    if (stats_) {
+      stats_->Record(reads);
+    }
   }
 
   template <typename T>
@@ -317,9 +416,67 @@ class SharedVector {
 
   // Pins the chunk while copying, so the read cannot interleave with a replace.
   std::vector<double> GetChunkMeta(std::size_t index) {
-    auto chunk = GetChunk(index);
+    auto chunk = GetChunk(index, /*count_read=*/false);
     return std::vector<double>(chunk->meta, chunk->meta + chunk->meta_size);
   }
+
+  // --- Read statistics -----------------------------------------------------
+
+  std::uint64_t GetChunkReadCount(std::size_t index) const {
+    return ChunkAt(index).read_count.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t GetChunkWriteCount(std::size_t index) const {
+    return ChunkAt(index).write_count.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t GetChunkLastReads(std::size_t index) const {
+    return ChunkAt(index).last_reads.load(std::memory_order_relaxed);
+  }
+
+  // Per-slot arrays over all `size()` slots, in slot order.
+  std::vector<std::uint64_t> ReadCounts() const {
+    return CollectChunkField(
+        [](const SharedChunk& c) { return c.read_count.load(std::memory_order_relaxed); });
+  }
+
+  std::vector<std::uint64_t> WriteCounts() const {
+    return CollectChunkField(
+        [](const SharedChunk& c) { return c.write_count.load(std::memory_order_relaxed); });
+  }
+
+  std::vector<std::uint64_t> LastReads() const {
+    return CollectChunkField(
+        [](const SharedChunk& c) { return c.last_reads.load(std::memory_order_relaxed); });
+  }
+
+  bool HasStats() const noexcept { return stats_ != nullptr; }
+
+  StatsSnapshot GetStatsSnapshot() const {
+    const SharedStats& s = RequireStats();
+    return StatsSnapshot{
+        s.replace_events.load(std::memory_order_relaxed),
+        s.reads_at_replace_total.load(std::memory_order_relaxed),
+        s.reads_at_replace_max.load(std::memory_order_relaxed),
+        s.blocked_replaces.load(std::memory_order_relaxed),
+        s.SampleCount(),
+        s.capacity};
+  }
+
+  // Recent reads-before-replacement samples, oldest first.
+  std::vector<std::uint32_t> ReadSamples() const {
+    const SharedStats& s = RequireStats();
+    const std::uint64_t written = s.cursor.load(std::memory_order_relaxed);
+    const std::size_t count = s.SampleCount();
+    std::vector<std::uint32_t> out(count);
+    const std::uint64_t start = written - count;  // oldest retained sample
+    for (std::size_t i = 0; i < count; ++i) {
+      out[i] = s.samples[(start + i) % s.capacity].load(std::memory_order_relaxed);
+    }
+    return out;
+  }
+
+  void ResetStats() { RequireStats().Reset(); }
 
   std::size_t GetRefCount() const {
     return shared_resources_->ref_count->load(std::memory_order_acquire);
@@ -350,6 +507,63 @@ class SharedVector {
     return chosen;
   }
 
+  // Creates the statistics block when this process creates the segment;
+  // attaching processes adopt the existing one (or none, for foreign segments).
+  SharedStats* ResolveStats(std::size_t requested, std::size_t max_chunks) {
+    auto& segment = shared_resources_->segment;
+    SharedStats* existing = segment.find<SharedStats>("stats").first;
+    if (existing) {
+      return existing;
+    }
+    if (!data_chunks_->empty()) {
+      return nullptr;  // populated segment without statistics support
+    }
+    const std::size_t capacity =
+        requested > 0 ? requested
+                      : std::max<std::size_t>(SharedStats::kMinDefaultCapacity,
+                                              2 * max_chunks);
+    auto* samples = segment.construct<std::atomic<std::uint32_t>>(
+        bi::anonymous_instance)[capacity]();
+    return segment.construct<SharedStats>("stats")(capacity, samples);
+  }
+
+  const SharedStats& RequireStats() const {
+    if (!stats_) {
+      throw std::runtime_error("Statistics are unavailable for this segment");
+    }
+    return *stats_;
+  }
+
+  SharedStats& RequireStats() {
+    if (!stats_) {
+      throw std::runtime_error("Statistics are unavailable for this segment");
+    }
+    return *stats_;
+  }
+
+  const SharedChunk& ChunkAt(std::size_t index) const {
+    if (index >=
+        shared_resources_->logical_size->load(std::memory_order_acquire)) {
+      throw std::out_of_range("Index out of range");
+    }
+    const SharedChunkPtr& ptr = (*data_chunks_)[index];
+    if (!ptr) {
+      throw std::runtime_error("Chunk pointer is null");
+    }
+    return *ptr;
+  }
+
+  template <typename Fn>
+  std::vector<std::uint64_t> CollectChunkField(Fn&& field) const {
+    const std::size_t count =
+        shared_resources_->logical_size->load(std::memory_order_acquire);
+    std::vector<std::uint64_t> out(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      out[i] = field(*(*data_chunks_)[i]);
+    }
+    return out;
+  }
+
   void CheckDType(DType provided) const {
     if (provided != dtype_) {
       throw std::invalid_argument(std::string("Segment dtype is ") +
@@ -370,6 +584,7 @@ class SharedVector {
   std::size_t chunk_size_;
   std::unique_ptr<SharedResources> shared_resources_;
   SharedChunksVector* data_chunks_;
+  SharedStats* stats_ = nullptr;
   DType dtype_ = DType::kFloat32;
 };
 

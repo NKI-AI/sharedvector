@@ -95,14 +95,22 @@ class LifecycleGuard:
         signal.raise_signal(signum)
 
     def arm(self) -> None:
-        """Install the ``atexit`` hook and signal handlers (idempotent)."""
+        """Install the ``atexit`` hook and signal handlers (idempotent).
+
+        Signals that are currently ignored stay ignored, following the Unix convention that a parent
+        (a shell running a background job, or a supervisor that opted out of ``SIGINT``) has made
+        that decision for this process.
+        """
         if self._armed:
             return
         self._armed = True
         self._owner_pid = os.getpid()
         atexit.register(self._run_cleanup)
         for sig in self._SIGNALS:
-            self._previous[sig] = signal.getsignal(sig)
+            previous = signal.getsignal(sig)
+            if previous == signal.SIG_IGN:
+                continue
+            self._previous[sig] = previous
             signal.signal(sig, self._signal_handler)
 
     def disarm(self) -> None:

@@ -26,6 +26,7 @@ from sharedvector.loaders import Chunk, Loader, NumpyLoader, ZarrLoader, cast_vo
 from sharedvector.pool import PoolHandle, ProducerSpec, ensure_pool, pool
 from sharedvector.service import ProducerService
 from sharedvector.spacing import collect_spacings, write_spacing_manifest
+from sharedvector.stats import PoolStats, collect_stats, stats_capacity_for
 from sharedvector.vector import (
     ArraySizeError,
     DataModifiedError,
@@ -68,6 +69,7 @@ __all__ = [
     "PoolHandle",
     "PoolPaths",
     "PoolSpawnError",
+    "PoolStats",
     "ProducerService",
     "ProducerSpec",
     "SharedMemoryDataset",
@@ -76,10 +78,12 @@ __all__ = [
     "__version__",
     "cast_volume",
     "collect_spacings",
+    "collect_stats",
     "ensure_pool",
     "no_meta",
     "pool",
     "probe_ready",
     "remove_shared_memory",
+    "stats_capacity_for",
     "write_spacing_manifest",
 ]

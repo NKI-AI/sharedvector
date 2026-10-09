@@ -38,6 +38,7 @@
 using sharedvector::DType;
 using sharedvector::SharedChunk;
 using sharedvector::SharedVector;
+using sharedvector::StatsSnapshot;
 using sharedvector::exceptions::MemoryError;
 using sharedvector::exceptions::OutOfMemoryError;
 
@@ -717,4 +718,128 @@ TEST_F(SharedVectorTest, OpenOnlyAttachesToExistingSegment) {
   auto chunk = consumer.GetChunk(0);
   EXPECT_EQ(chunk->Count<float>(), 3);
   EXPECT_FLOAT_EQ(chunk->As<float>()[2], 3.0f);
+}
+
+// --- Read statistics ---------------------------------------------------------
+
+TEST_F(SharedVectorTest, ReadCountIncrementsOnGetChunkAndNotOnMeta) {
+  shared_vector->append(std::vector<float>{1.0f, 2.0f}, {2}, {0.5});
+
+  {
+    auto a = shared_vector->GetChunk(0);
+    auto b = shared_vector->GetChunk(0);
+    EXPECT_EQ(shared_vector->GetChunkReadCount(0), 2);
+  }
+  shared_vector->GetChunkMeta(0);
+  shared_vector->GetChunkShape(0);
+  shared_vector->GetChunkRefCount(0);
+
+  EXPECT_EQ(shared_vector->GetChunkReadCount(0), 2);
+  EXPECT_EQ(shared_vector->GetChunkWriteCount(0), 1);
+  EXPECT_EQ(shared_vector->GetChunkLastReads(0), 0);
+}
+
+TEST_F(SharedVectorTest, ReplaceCapturesReadsAndResetsCounter) {
+  shared_vector->append(std::vector<float>{1.0f}, {1});
+  for (int i = 0; i < 3; ++i) {
+    shared_vector->GetChunk(0);
+  }
+
+  shared_vector->replace(0, std::vector<float>{2.0f}, {1});
+
+  EXPECT_EQ(shared_vector->GetChunkReadCount(0), 0);
+  EXPECT_EQ(shared_vector->GetChunkLastReads(0), 3);
+  EXPECT_EQ(shared_vector->GetChunkWriteCount(0), 2);
+  StatsSnapshot s = shared_vector->GetStatsSnapshot();
+  EXPECT_EQ(s.replace_events, 1);
+  EXPECT_EQ(s.reads_at_replace_total, 3);
+  EXPECT_EQ(s.reads_at_replace_max, 3);
+  EXPECT_EQ(s.blocked_replaces, 0);
+  EXPECT_EQ(s.sample_count, 1);
+  EXPECT_EQ(shared_vector->ReadSamples(), (std::vector<std::uint32_t>{3}));
+}
+
+TEST_F(SharedVectorTest, BlockedReplaceIsCounted) {
+  shared_vector->append(std::vector<float>{1.0f}, {1});
+  auto pinned = shared_vector->GetChunk(0);
+
+  EXPECT_THROW(shared_vector->replace(0, std::vector<float>{2.0f}, {1}),
+               std::runtime_error);
+
+  EXPECT_EQ(shared_vector->GetStatsSnapshot().blocked_replaces, 1);
+  EXPECT_EQ(shared_vector->GetStatsSnapshot().replace_events, 0);
+  EXPECT_EQ(shared_vector->GetChunkReadCount(0), 1);  // pinned read still counts
+}
+
+TEST_F(SharedVectorTest, StatsTrackTotalsAndMaxAcrossSlots) {
+  shared_vector->append(std::vector<float>{1.0f}, {1});
+  shared_vector->append(std::vector<float>{2.0f}, {1});
+  for (int i = 0; i < 5; ++i) shared_vector->GetChunk(0);
+  shared_vector->GetChunk(1);
+
+  shared_vector->replace(0, std::vector<float>{3.0f}, {1});
+  shared_vector->replace(1, std::vector<float>{4.0f}, {1});
+  shared_vector->replace(1, std::vector<float>{5.0f}, {1});
+
+  StatsSnapshot s = shared_vector->GetStatsSnapshot();
+  EXPECT_EQ(s.replace_events, 3);
+  EXPECT_EQ(s.reads_at_replace_total, 6);
+  EXPECT_EQ(s.reads_at_replace_max, 5);
+  EXPECT_EQ(shared_vector->ReadSamples(), (std::vector<std::uint32_t>{5, 1, 0}));
+  EXPECT_EQ(shared_vector->LastReads(), (std::vector<std::uint64_t>{5, 0}));
+  EXPECT_EQ(shared_vector->WriteCounts(), (std::vector<std::uint64_t>{2, 3}));
+  EXPECT_EQ(shared_vector->ReadCounts(), (std::vector<std::uint64_t>{0, 0}));
+}
+
+TEST_F(SharedVectorTest, RingBufferWrapsKeepingNewestInOrder) {
+  const std::string name = shared_memory_name + "_ring";
+  boost::interprocess::shared_memory_object::remove(name.c_str());
+  {
+    SharedVector vec(name, chunk_size, max_memory_size, std::nullopt, true,
+                     /*stats_capacity=*/4);
+    vec.append(std::vector<float>{1.0f}, {1});
+    for (int round = 1; round <= 6; ++round) {
+      for (int i = 0; i < round; ++i) vec.GetChunk(0);
+      vec.replace(0, std::vector<float>{1.0f}, {1});
+    }
+
+    StatsSnapshot s = vec.GetStatsSnapshot();
+    EXPECT_EQ(s.sample_capacity, 4);
+    EXPECT_EQ(s.sample_count, 4);
+    EXPECT_EQ(s.replace_events, 6);
+    EXPECT_EQ(vec.ReadSamples(), (std::vector<std::uint32_t>{3, 4, 5, 6}));
+  }
+  boost::interprocess::shared_memory_object::remove(name.c_str());
+}
+
+TEST_F(SharedVectorTest, ResetStatsZeroesPoolCountersOnly) {
+  shared_vector->append(std::vector<float>{1.0f}, {1});
+  shared_vector->GetChunk(0);
+  shared_vector->replace(0, std::vector<float>{2.0f}, {1});
+
+  shared_vector->ResetStats();
+
+  StatsSnapshot s = shared_vector->GetStatsSnapshot();
+  EXPECT_EQ(s.replace_events, 0);
+  EXPECT_EQ(s.reads_at_replace_max, 0);
+  EXPECT_EQ(s.sample_count, 0);
+  EXPECT_TRUE(shared_vector->ReadSamples().empty());
+  EXPECT_EQ(shared_vector->GetChunkLastReads(0), 1);
+  EXPECT_EQ(shared_vector->GetChunkWriteCount(0), 2);
+}
+
+TEST_F(SharedVectorTest, AttachingProcessSharesStatsAndDefaultCapacity) {
+  shared_vector->append(std::vector<float>{1.0f}, {1});
+  SharedVector consumer(shared_memory_name, 4096, 65536, std::nullopt,
+                        /*create=*/false);
+
+  consumer.GetChunk(0);
+  consumer.GetChunk(0);
+  shared_vector->replace(0, std::vector<float>{2.0f}, {1});
+
+  EXPECT_TRUE(consumer.HasStats());
+  EXPECT_EQ(consumer.GetStatsSnapshot().replace_events, 1);
+  EXPECT_EQ(consumer.ReadSamples(), (std::vector<std::uint32_t>{2}));
+  // default capacity = 2 * max_chunks, with max_chunks = 10 for this fixture
+  EXPECT_EQ(consumer.GetStatsSnapshot().sample_capacity, 20);
 }

@@ -46,6 +46,7 @@ from sharedvector.coordination import (
 )
 from sharedvector.lifecycle import LifecycleGuard, ParentWatchdog, install_parent_death_signal
 from sharedvector.loaders import Loader
+from sharedvector.stats import PoolStats, collect_stats
 from sharedvector.vector import SharedVector, remove_shared_memory
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ class PoolHandle:
         self._join_timeout = join_timeout
         self._owner_pid = os.getpid() if lock is not None else None
         self._closed = False
+        self._vector: SharedVector | None = None
         self._guard: LifecycleGuard | None = None
         if self.is_owner:
             self._guard = LifecycleGuard(self._teardown)
@@ -163,6 +165,12 @@ class PoolHandle:
         """Open the segment without creating it."""
         return attach(self._paths)
 
+    def stats(self) -> PoolStats:
+        """Return the pool's read statistics (``handle.stats().as_dict()`` suits ``wandb.log``)."""
+        if self._vector is None:
+            self._vector = self.attach()
+        return collect_stats(self._vector)
+
     def close(self) -> None:
         """Owner: stop the producer and remove the segment. Follower: forget the handle. Idempotent."""
         if self._closed:
@@ -173,6 +181,7 @@ class PoolHandle:
             self._forget()
 
     def _forget(self) -> None:
+        self._vector = None
         with _REGISTRY_LOCK:
             if _REGISTRY.get(self.name) is self:
                 del _REGISTRY[self.name]
@@ -184,6 +193,7 @@ class PoolHandle:
         self._supervisor = None
         self._guard = None
         self._owner_pid = None
+        self._vector = None
 
     def _teardown(self) -> None:
         if os.getpid() != self._owner_pid:

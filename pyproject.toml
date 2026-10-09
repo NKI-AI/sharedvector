@@ -36,8 +36,7 @@ sharedvector-producer = "sharedvector.cli:producer_main"
 sharedvector-spacing-manifest = "sharedvector.cli:spacing_manifest_main"
 
 [project.urls]
-# TODO: replace <ORG> once the GitHub organisation is decided.
-Repository = "https://github.com/<ORG>/sharedvector"
+Repository = "https://github.com/NKI-AI/sharedvector"
 
 # ------------------------------------------------------------------ build
 [tool.scikit-build]

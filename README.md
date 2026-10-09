@@ -65,6 +65,28 @@ owner.replace(0, other_array)  # RuntimeError while a view is pinned
 remove_shared_memory("demo")
 ```
 
+## Statistics
+
+Every attached process can read how the pool is being used. The segment counts, per slot, the reads
+since the slot's last write, its write count and the read count it had when it was last replaced, and
+pool-wide it keeps a ring of recent reads-before-replacement samples plus lifetime counters, including
+replace attempts that were refused because a consumer had the slot pinned.
+
+```python
+stats = handle.stats()  # PoolHandle, SharedMemoryDataset and ProducerService all have .stats()
+stats.recent_median  # reads a slot got before being replaced, over the recent window
+stats.reads_at_replace_mean  # lifetime mean
+stats.blocked_replaces  # producer/consumer contention
+wandb.log(stats.as_dict())  # flat {"sharedvector/<field>": number} mapping
+
+vec = handle.attach()  # low level: per-slot arrays and the raw ring
+vec.read_counts(), vec.write_counts(), vec.last_reads(), vec.read_samples(), vec.stats, vec.reset_stats()
+```
+
+`get()` counts as one read; `get_meta()` does not. Counters are relaxed atomics, so a snapshot can lag a
+few events. The ring holds two refresh cycles of the pool by default (`stats_capacity` on
+`SharedVector`; the service sizes it with a 4096-sample floor).
+
 ## Coordination files
 
 For a pool named `run42` (directory `/dev/shm`, override with `lock_dir=` or `SHAREDVECTOR_LOCK_DIR`;

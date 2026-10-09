@@ -96,3 +96,17 @@ def test_signal_during_cleanup_does_not_interrupt_it() -> None:
     finally:
         guard.disarm()
         signal.signal(signal.SIGTERM, previous)
+
+
+def test_arm_leaves_ignored_signals_ignored() -> None:
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    guard = LifecycleGuard(lambda: None)
+    try:
+        guard.arm()
+
+        assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+        assert signal.getsignal(signal.SIGTERM) == guard._signal_handler
+    finally:
+        guard.disarm()
+        signal.signal(signal.SIGINT, previous)

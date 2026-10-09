@@ -14,6 +14,7 @@
 """Standalone producer service owning a shared-memory chunk pool."""
 
 import contextlib
+import gc
 import logging
 import multiprocessing as mp
 import threading
@@ -27,11 +28,13 @@ from sharedvector.coordination import PoolPaths, clear_marker, write_marker
 from sharedvector.lifecycle import LifecycleGuard
 from sharedvector.loaders import Loader
 from sharedvector.producer import producer_worker
+from sharedvector.stats import PoolStats, collect_stats, stats_capacity_for
 from sharedvector.vector import SharedVector, remove_shared_memory
 
 logger = logging.getLogger(__name__)
 
 _CHUNK_OVERHEAD_BYTES = 512
+_STATS_OVERHEAD_BYTES = 4096
 _BOOTSTRAP_POLL_SECONDS = 0.2
 _BOOTSTRAP_STALL_SECONDS = 30.0
 
@@ -116,7 +119,10 @@ class ProducerService:
         self._dtype = dtype
         self._generation = generation or uuid.uuid4().hex
         self._log_level = log_level
-        self._max_memory_size = slot_count * (chunk_size + _CHUNK_OVERHEAD_BYTES)
+        self._stats_capacity = stats_capacity_for(slot_count)
+        self._max_memory_size = (
+            slot_count * (chunk_size + _CHUNK_OVERHEAD_BYTES) + 4 * self._stats_capacity + _STATS_OVERHEAD_BYTES
+        )
 
         self._ctx = mp.get_context("spawn")
         self._stop_event: EventType | None = None
@@ -146,7 +152,13 @@ class ProducerService:
             return
         clear_marker(self._paths)
         remove_shared_memory(self.name)
-        self._vector = SharedVector(self.name, self._chunk_size, self._max_memory_size, dtype=self._dtype)
+        self._vector = SharedVector(
+            self.name,
+            self._chunk_size,
+            self._max_memory_size,
+            dtype=self._dtype,
+            stats_capacity=self._stats_capacity,
+        )
 
         self._stop_event = self._ctx.Event()
         slot_ranges = partition(self._slot_count, self._num_producers)
@@ -177,6 +189,16 @@ class ProducerService:
         self._await_bootstrap()
         write_marker(self._paths, self._generation)
         self._started = True
+
+    def stats(self) -> PoolStats:
+        """Return the pool's read statistics.
+
+        Raises:
+            RuntimeError: If the service has not been started.
+        """
+        if self._vector is None:
+            raise RuntimeError("ProducerService.stats() requires a started service")
+        return collect_stats(self._vector)
 
     def run(self) -> None:
         """Start the service and block until terminated by signal or exit."""
@@ -223,6 +245,11 @@ class ProducerService:
                 process.join(timeout=1.0)
         self._processes.clear()
         self._vector = None
+        # Drop the last reference to the stop event now so its POSIX semaphores are unlinked by their
+        # finalizer. Exiting through a re-raised signal skips finalizers, which otherwise leaves them
+        # to the multiprocessing resource tracker and its "leaked semaphore objects" warning.
+        self._stop_event = None
+        gc.collect()
         try:
             remove_shared_memory(self.name)
         except Exception:

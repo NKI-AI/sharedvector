@@ -16,6 +16,7 @@
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -110,6 +111,39 @@ inline void ReplacePython(SharedVector& vector, size_t index, py::array array,
 inline py::array_t<double> GetMetaPython(SharedVector& vector, size_t index) {
   std::vector<double> meta = vector.GetChunkMeta(index);
   return py::array_t<double>(static_cast<ssize_t>(meta.size()), meta.data());
+}
+
+template <typename T>
+inline py::array_t<T> ToArray(const std::vector<T>& values) {
+  return py::array_t<T>(static_cast<ssize_t>(values.size()), values.data());
+}
+
+inline py::array_t<std::uint64_t> ReadCountsPython(const SharedVector& vector) {
+  return ToArray(vector.ReadCounts());
+}
+
+inline py::array_t<std::uint64_t> WriteCountsPython(const SharedVector& vector) {
+  return ToArray(vector.WriteCounts());
+}
+
+inline py::array_t<std::uint64_t> LastReadsPython(const SharedVector& vector) {
+  return ToArray(vector.LastReads());
+}
+
+inline py::array_t<std::uint32_t> ReadSamplesPython(const SharedVector& vector) {
+  return ToArray(vector.ReadSamples());
+}
+
+inline py::dict StatsPython(const SharedVector& vector) {
+  const StatsSnapshot s = vector.GetStatsSnapshot();
+  py::dict out;
+  out["replace_events"] = s.replace_events;
+  out["reads_at_replace_total"] = s.reads_at_replace_total;
+  out["reads_at_replace_max"] = s.reads_at_replace_max;
+  out["blocked_replaces"] = s.blocked_replaces;
+  out["sample_count"] = s.sample_count;
+  out["sample_capacity"] = s.sample_capacity;
+  return out;
 }
 
 }  // namespace sharedvector::python

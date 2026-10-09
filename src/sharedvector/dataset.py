@@ -23,6 +23,7 @@ from torch.utils.data import Dataset
 
 from sharedvector.coordination import PoolPaths, attach, wait_until_ready
 from sharedvector.pool import PoolHandle
+from sharedvector.stats import PoolStats, collect_stats
 from sharedvector.vector import SharedVector
 
 Transform = Callable[[dict[str, Any]], dict[str, Any]]
@@ -95,6 +96,10 @@ class SharedMemoryDataset(Dataset[dict[str, Any]]):
     def name(self) -> str:
         """Pool name."""
         return self._paths.name
+
+    def stats(self) -> PoolStats:
+        """Return the pool's read statistics as seen from this consumer."""
+        return collect_stats(self._vector)
 
     def _attach(self) -> SharedVector:
         """Wait for readiness and open the segment without creating it."""
